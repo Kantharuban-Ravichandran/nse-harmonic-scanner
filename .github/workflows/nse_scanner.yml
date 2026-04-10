@@ -2,14 +2,14 @@ name: NSE Harmonic Scanner
 
 on:
   schedule:
-    # 5:00 PM IST = 11:30 UTC (IST is UTC+5:30)
-    - cron: '30 11 * * 1-5'   # Mon–Fri only
-  workflow_dispatch:           # allow manual trigger
+    # 5:00 PM IST = 11:30 UTC
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -19,20 +19,22 @@ jobs:
       EMAIL_FROM:         ${{ secrets.EMAIL_FROM }}
       EMAIL_TO:           ${{ secrets.EMAIL_TO }}
       EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
-      EMAIL_SMTP_HOST:    ${{ secrets.EMAIL_SMTP_HOST }}
-      EMAIL_SMTP_PORT:    ${{ secrets.EMAIL_SMTP_PORT }}
+      EMAIL_SMTP_HOST:    smtp.gmail.com
+      EMAIL_SMTP_PORT:    "587"
+      # Conservative settings to avoid Yahoo Finance rate limits
+      BATCH_SIZE:         "25"
+      MAX_WORKERS:        "4"
       ZIGZAG_DEPTH:       "12"
       PRICE_PERIOD:       "1y"
       PRICE_INTERVAL:     "1d"
-      BATCH_SIZE:         "50"
-      MAX_WORKERS:        "8"
       FIB_TOLERANCE:      "0.05"
+      DOWNLOAD_RETRIES:   "3"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -41,14 +43,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run harmonic scanner
+      - name: Run scanner
         run: python harmonic_scanner.py
 
-      - name: Upload results artifact
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results-${{ github.run_id }}
+          name: scan-${{ github.run_id }}
           path: |
             results_*.json
             scanner.log
