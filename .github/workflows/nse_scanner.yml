@@ -1,0 +1,55 @@
+name: NSE Harmonic Scanner
+
+on:
+  schedule:
+    # 5:00 PM IST = 11:30 UTC (IST is UTC+5:30)
+    - cron: '30 11 * * 1-5'   # Mon–Fri only
+  workflow_dispatch:           # allow manual trigger
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      GOOGLE_SHEET_ID:    ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_CREDS_JSON:  ${{ secrets.GOOGLE_CREDS_JSON }}
+      EMAIL_FROM:         ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+      EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_SMTP_HOST:    ${{ secrets.EMAIL_SMTP_HOST }}
+      EMAIL_SMTP_PORT:    ${{ secrets.EMAIL_SMTP_PORT }}
+      ZIGZAG_DEPTH:       "12"
+      PRICE_PERIOD:       "1y"
+      PRICE_INTERVAL:     "1d"
+      BATCH_SIZE:         "50"
+      MAX_WORKERS:        "8"
+      FIB_TOLERANCE:      "0.05"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run harmonic scanner
+        run: python harmonic_scanner.py
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: |
+            results_*.json
+            scanner.log
+          retention-days: 30
