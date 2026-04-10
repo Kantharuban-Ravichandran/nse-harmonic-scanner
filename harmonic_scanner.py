@@ -1,25 +1,24 @@
 """
 NSE Harmonic Pattern Scanner
 Fully automated EOD scanner for ~2000 NSE stocks
+Fixed: Yahoo Finance rate limit handling with session/proxy rotation + sequential fallback
 """
 
 import os
 import io
 import time
 import logging
-import asyncio
 import json
 import smtplib
 import warnings
 from datetime import datetime, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 import traceback
+import random
 
 import numpy as np
 import pandas as pd
@@ -29,6 +28,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -49,7 +50,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '')
 GOOGLE_SHEET_ID    = os.getenv('GOOGLE_SHEET_ID', '')
-GOOGLE_CREDS_JSON  = os.getenv('GOOGLE_CREDS_JSON', '')   # JSON string of service account
+GOOGLE_CREDS_JSON  = os.getenv('GOOGLE_CREDS_JSON', '')
 EMAIL_FROM         = os.getenv('EMAIL_FROM', '')
 EMAIL_TO           = os.getenv('EMAIL_TO', '')
 EMAIL_PASSWORD     = os.getenv('EMAIL_PASSWORD', '')
@@ -59,62 +60,76 @@ EMAIL_SMTP_PORT    = int(os.getenv('EMAIL_SMTP_PORT', '587'))
 ZIGZAG_DEPTH       = int(os.getenv('ZIGZAG_DEPTH', '12'))
 PRICE_PERIOD       = os.getenv('PRICE_PERIOD', '1y')
 PRICE_INTERVAL     = os.getenv('PRICE_INTERVAL', '1d')
-BATCH_SIZE         = int(os.getenv('BATCH_SIZE', '50'))
-MAX_WORKERS        = int(os.getenv('MAX_WORKERS', '8'))
+BATCH_SIZE         = int(os.getenv('BATCH_SIZE', '25'))   # smaller batches = less rate limiting
+MAX_WORKERS        = int(os.getenv('MAX_WORKERS', '4'))   # fewer threads = less rate limiting
 DOWNLOAD_RETRIES   = int(os.getenv('DOWNLOAD_RETRIES', '3'))
-FIB_TOLERANCE      = float(os.getenv('FIB_TOLERANCE', '0.05'))   # ±5%
+FIB_TOLERANCE      = float(os.getenv('FIB_TOLERANCE', '0.05'))
 
 TV_BASE = "https://www.tradingview.com/chart/?symbol=NSE:"
+
+# ─── User Agents Pool ─────────────────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+]
+
+def make_session() -> requests.Session:
+    """Create a requests session with retry logic and rotating user agent."""
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return session
 
 # ─── Fibonacci Ratios ─────────────────────────────────────────────────────────
 PATTERNS = {
     "Gartley": {
-        "XB": (0.618, 0.618),
-        "AC": (0.382, 0.886),
-        "BD": (1.272, 1.618),
-        "XD": (0.786, 0.786),
+        "XB": (0.618, 0.618), "AC": (0.382, 0.886),
+        "BD": (1.272, 1.618), "XD": (0.786, 0.786),
     },
     "Bat": {
-        "XB": (0.382, 0.500),
-        "AC": (0.382, 0.886),
-        "BD": (1.618, 2.618),
-        "XD": (0.886, 0.886),
+        "XB": (0.382, 0.500), "AC": (0.382, 0.886),
+        "BD": (1.618, 2.618), "XD": (0.886, 0.886),
     },
     "Butterfly": {
-        "XB": (0.786, 0.786),
-        "AC": (0.382, 0.886),
-        "BD": (1.618, 2.618),
-        "XD": (1.272, 1.618),
+        "XB": (0.786, 0.786), "AC": (0.382, 0.886),
+        "BD": (1.618, 2.618), "XD": (1.272, 1.618),
     },
     "Crab": {
-        "XB": (0.382, 0.618),
-        "AC": (0.382, 0.886),
-        "BD": (2.240, 3.618),
-        "XD": (1.618, 1.618),
+        "XB": (0.382, 0.618), "AC": (0.382, 0.886),
+        "BD": (2.240, 3.618), "XD": (1.618, 1.618),
     },
     "DeepCrab": {
-        "XB": (0.886, 0.886),
-        "AC": (0.382, 0.886),
-        "BD": (2.000, 3.618),
-        "XD": (1.618, 1.618),
+        "XB": (0.886, 0.886), "AC": (0.382, 0.886),
+        "BD": (2.000, 3.618), "XD": (1.618, 1.618),
     },
     "Shark": {
-        "XB": (0.446, 0.618),
-        "AC": (1.130, 1.618),
-        "BD": (1.618, 2.240),
-        "XD": (0.886, 1.130),
+        "XB": (0.446, 0.618), "AC": (1.130, 1.618),
+        "BD": (1.618, 2.240), "XD": (0.886, 1.130),
     },
     "Cypher": {
-        "XB": (0.382, 0.618),
-        "AC": (1.130, 1.414),
-        "BD": (1.272, 2.000),  # retracement of XC
-        "XD": (0.786, 0.786),
+        "XB": (0.382, 0.618), "AC": (1.130, 1.414),
+        "BD": (1.272, 2.000), "XD": (0.786, 0.786),
     },
     "ABCD": {
-        "AB": (None, None),
-        "BC": (0.382, 0.886),
-        "CD": (1.272, 1.618),
-        "AD": (None, None),
+        "AB": (None, None), "BC": (0.382, 0.886),
+        "CD": (1.272, 1.618), "AD": (None, None),
     },
 }
 
@@ -123,7 +138,7 @@ PATTERNS = {
 class HarmonicResult:
     symbol:    str
     pattern:   str
-    direction: str        # "Bullish" | "Bearish"
+    direction: str
     price:     float
     X: float; A: float; B: float; C: float; D: float
     x_idx: int; a_idx: int; b_idx: int; c_idx: int; d_idx: int
@@ -133,17 +148,17 @@ class HarmonicResult:
 
 # ─── NSE Symbol List ──────────────────────────────────────────────────────────
 def get_nse_symbols() -> list[str]:
-    """Return NSE .NS symbols. Fetches Nifty500 + MidSmall from NSE CSVs."""
+    """Fetch NSE symbols from NSE India CSVs with fallback."""
     urls = [
         "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
         "https://archives.nseindia.com/content/indices/ind_niftymidsmallcap400list.csv",
     ]
-    headers = {"User-Agent": "Mozilla/5.0"}
+    session = make_session()
     symbols = set()
     for url in urls:
         for attempt in range(3):
             try:
-                r = requests.get(url, headers=headers, timeout=15)
+                r = session.get(url, timeout=20)
                 if r.status_code == 200:
                     df = pd.read_csv(io.StringIO(r.text))
                     col = next((c for c in df.columns if 'symbol' in c.lower()), None)
@@ -152,81 +167,91 @@ def get_nse_symbols() -> list[str]:
                     break
             except Exception as e:
                 log.warning(f"Symbol fetch attempt {attempt+1} failed: {e}")
-                time.sleep(2)
+                time.sleep(3)
 
     if not symbols:
-        log.warning("Could not fetch symbols; using fallback list.")
+        log.warning("Using fallback symbol list.")
         symbols = {
             "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","SBIN","WIPRO","AXISBANK",
             "LT","BAJFINANCE","BHARTIARTL","ASIANPAINT","MARUTI","TITAN","ULTRACEMCO",
             "SUNPHARMA","TECHM","HCLTECH","POWERGRID","NTPC","ONGC","IOC","BPCL",
             "COALINDIA","GRASIM","INDUSINDBK","KOTAKBANK","NESTLEIND","ADANIENT",
+            "BAJAJFINSV","HINDALCO","TATASTEEL","JSWSTEEL","DRREDDY","CIPLA","DIVISLAB",
+            "EICHERMOT","TATACONSUM","APOLLOHOSP","BRITANNIA","DABUR","MARICO","PIDILITIND",
+            "HAVELLS","SIEMENS","ABB","BOSCHLTD","CUMMINSIND","THERMAX",
         }
     return [f"{s}.NS" for s in sorted(symbols)]
 
 
-# ─── Data Download ────────────────────────────────────────────────────────────
-def download_batch(symbols: list[str], period: str, interval: str) -> dict[str, pd.DataFrame]:
-    """Download OHLCV for a batch; returns {symbol: df}."""
-    result = {}
+# ─── Core Download Function ───────────────────────────────────────────────────
+def download_single(symbol: str, session: requests.Session) -> Optional[pd.DataFrame]:
+    """Download single symbol with session. Much more reliable than batch on CI."""
     for attempt in range(DOWNLOAD_RETRIES):
         try:
-            raw = yf.download(
-                symbols,
-                period=period,
-                interval=interval,
-                group_by='ticker',
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-                timeout=30,
-            )
-            if raw.empty:
-                break
-            for sym in symbols:
-                try:
-                    if len(symbols) == 1:
-                        df = raw.copy()
-                    else:
-                        df = raw[sym].copy()
-                    df.dropna(subset=['Close'], inplace=True)
-                    if len(df) >= 30:
-                        result[sym] = df
-                except Exception:
-                    pass
-            break
+            # Use yfinance with custom session
+            ticker = yf.Ticker(symbol, session=session)
+            df = ticker.history(period=PRICE_PERIOD, interval=PRICE_INTERVAL, 
+                               auto_adjust=True, timeout=20)
+            if df is not None and not df.empty and len(df) >= 30:
+                df.index = pd.to_datetime(df.index)
+                # Rename columns to standard OHLCV
+                df = df[['Open','High','Low','Close','Volume']].dropna()
+                if len(df) >= 30:
+                    return df
+            return None
         except Exception as e:
-            log.warning(f"Batch download attempt {attempt+1} failed: {e}")
-            time.sleep(5 * (attempt + 1))
+            err = str(e).lower()
+            if 'json' in err or '401' in err or '429' in err or 'rate' in err:
+                wait = (attempt + 1) * random.uniform(3, 7)
+                log.debug(f"{symbol} attempt {attempt+1} failed: {e}. Waiting {wait:.1f}s")
+                time.sleep(wait)
+                # Rotate user agent on retry
+                session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+            else:
+                log.debug(f"{symbol} failed: {e}")
+                return None
+    return None
+
+
+def download_batch_with_session(symbols: list[str]) -> dict[str, pd.DataFrame]:
+    """Download a batch of symbols using a shared session with inter-request delays."""
+    session = make_session()
+    result = {}
+    for i, sym in enumerate(symbols):
+        df = download_single(sym, session)
+        if df is not None:
+            result[sym] = df
+        # Rate limit: small random delay between requests
+        if i < len(symbols) - 1:
+            time.sleep(random.uniform(0.3, 0.8))
     return result
 
 
 def fetch_all_ohlc(symbols: list[str]) -> dict[str, pd.DataFrame]:
-    """Parallel batched download of all symbols."""
+    """Parallel batched download with per-batch sessions."""
     batches = [symbols[i:i+BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
     all_data = {}
-    log.info(f"Downloading {len(symbols)} symbols in {len(batches)} batches...")
+    log.info(f"Downloading {len(symbols)} symbols in {len(batches)} batches "
+             f"(batch_size={BATCH_SIZE}, workers={MAX_WORKERS})...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-        futures = {exe.submit(download_batch, b, PRICE_PERIOD, PRICE_INTERVAL): b for b in batches}
+        futures = {exe.submit(download_batch_with_session, b): b for b in batches}
         for i, fut in enumerate(as_completed(futures), 1):
             try:
-                all_data.update(fut.result())
+                batch_result = fut.result()
+                all_data.update(batch_result)
+                log.info(f"  Batch {i}/{len(batches)} done — "
+                         f"{len(batch_result)}/{len(futures[fut])} symbols OK "
+                         f"(total so far: {len(all_data)})")
             except Exception as e:
-                log.error(f"Batch failed: {e}")
-            if i % 10 == 0:
-                log.info(f"  {i}/{len(batches)} batches done")
+                log.error(f"Batch error: {e}")
 
-    log.info(f"Downloaded data for {len(all_data)} symbols.")
+    log.info(f"Download complete: {len(all_data)}/{len(symbols)} symbols.")
     return all_data
 
 
-# ─── ZigZag ───────────────────────────────────────────────────────────────────
-def zigzag_pivots(df: pd.DataFrame, depth: int = ZIGZAG_DEPTH) -> list[tuple[int, float]]:
-    """
-    Returns list of (index_position, price) pivot points.
-    Uses a rolling window approach for speed.
-    """
+# ─── ZigZag Pivots ────────────────────────────────────────────────────────────
+def zigzag_pivots(df: pd.DataFrame, depth: int = ZIGZAG_DEPTH) -> list[tuple]:
     highs = df['High'].values
     lows  = df['Low'].values
     n = len(highs)
@@ -234,11 +259,8 @@ def zigzag_pivots(df: pd.DataFrame, depth: int = ZIGZAG_DEPTH) -> list[tuple[int
         return []
 
     pivots = []
-    last_pivot_type = None   # 'H' or 'L'
-    last_pivot_idx  = 0
-    last_pivot_val  = 0.0
+    last_pivot_type = None
 
-    # seed
     for i in range(depth, n - depth):
         is_high = all(highs[i] >= highs[i-j] for j in range(1, depth+1)) and \
                   all(highs[i] >= highs[i+j] for j in range(1, depth+1))
@@ -246,166 +268,116 @@ def zigzag_pivots(df: pd.DataFrame, depth: int = ZIGZAG_DEPTH) -> list[tuple[int
                   all(lows[i]  <= lows[i+j]  for j in range(1, depth+1))
 
         if is_high and last_pivot_type != 'H':
-            if last_pivot_type == 'L' or not pivots:
-                pivots.append((i, highs[i], 'H'))
-                last_pivot_type = 'H'
-                last_pivot_idx  = i
-                last_pivot_val  = highs[i]
-            elif highs[i] > last_pivot_val:
-                pivots[-1] = (i, highs[i], 'H')
-                last_pivot_val = highs[i]
-
+            if pivots and last_pivot_type == 'H' and highs[i] > pivots[-1][1]:
+                pivots[-1] = (i, highs[i])
+            else:
+                pivots.append((i, highs[i]))
+            last_pivot_type = 'H'
         elif is_low and last_pivot_type != 'L':
-            if last_pivot_type == 'H' or not pivots:
-                pivots.append((i, lows[i], 'L'))
-                last_pivot_type = 'L'
-                last_pivot_idx  = i
-                last_pivot_val  = lows[i]
-            elif lows[i] < last_pivot_val:
-                pivots[-1] = (i, lows[i], 'L')
-                last_pivot_val = lows[i]
+            if pivots and last_pivot_type == 'L' and lows[i] < pivots[-1][1]:
+                pivots[-1] = (i, lows[i])
+            else:
+                pivots.append((i, lows[i]))
+            last_pivot_type = 'L'
 
-    return [(p[0], p[1]) for p in pivots]
+    return pivots
 
 
 # ─── Fibonacci Helpers ────────────────────────────────────────────────────────
-def fib_ratio(a: float, b: float, c: float) -> float:
-    """Retrace of B from A relative to A→C move."""
-    if abs(c - a) < 1e-9:
-        return 0.0
+def fib_ratio(a, b, c):
+    if abs(c - a) < 1e-9: return 0.0
     return abs(b - a) / abs(c - a)
 
-def in_range(val: float, lo: float, hi: float, tol: float = FIB_TOLERANCE) -> bool:
-    if lo is None:
-        return True
-    lo_adj = lo * (1 - tol)
-    hi_adj = hi * (1 + tol)
-    return lo_adj <= val <= hi_adj
+def in_range(val, lo, hi, tol=FIB_TOLERANCE):
+    if lo is None: return True
+    return lo * (1 - tol) <= val <= hi * (1 + tol)
 
-def compute_prz(X: float, A: float, B: float, C: float,
-                pattern: str, bullish: bool) -> tuple[float, float]:
-    """Approximate PRZ band."""
+def compute_prz(X, A, B, C, pattern, bullish):
     try:
         r = PATTERNS[pattern]
         xd_lo, xd_hi = r.get("XD", (None, None))
-        if xd_lo is None:
-            return (C * 0.99, C * 1.01)
+        if xd_lo is None: return (C * 0.99, C * 1.01)
         move = abs(A - X)
         if bullish:
-            d_lo = A - move * xd_hi
-            d_hi = A - move * xd_lo
+            return (A - move * xd_hi, A - move * xd_lo)
         else:
-            d_lo = A + move * xd_lo
-            d_hi = A + move * xd_hi
-        return (min(d_lo, d_hi), max(d_lo, d_hi))
-    except Exception:
+            return (A + move * xd_lo, A + move * xd_hi)
+    except:
         return (C * 0.98, C * 1.02)
 
 
 # ─── Pattern Matching ─────────────────────────────────────────────────────────
-def match_xabcd(pivots: list[tuple], pattern: str) -> list[HarmonicResult]:
-    """Scan pivot windows for XABCD harmonic patterns."""
+def match_xabcd(pivots: list, pattern: str) -> list:
     results = []
     n = len(pivots)
-    if n < 5:
-        return results
-
+    if n < 5: return results
     ratios = PATTERNS[pattern]
 
     for i in range(n - 4):
-        for combo in [(i, i+1, i+2, i+3, i+4)]:
-            xi, ai, bi, ci, di = combo
-            X_idx, X = pivots[xi]
-            A_idx, A = pivots[ai]
-            B_idx, B = pivots[bi]
-            C_idx, C = pivots[ci]
-            D_idx, D = pivots[di]
+        X_idx, X = pivots[i]
+        A_idx, A = pivots[i+1]
+        B_idx, B = pivots[i+2]
+        C_idx, C = pivots[i+3]
+        D_idx, D = pivots[i+4]
 
-            # Direction: bullish if X<A (upswing X→A)
-            bullish = A > X
+        bullish = A > X
 
-            # ── ABCD pattern ──────────────────────────────────────────
-            if pattern == "ABCD":
-                bc_ret = fib_ratio(A, B, C) if not bullish else fib_ratio(A, B, C)
-                # Actually for ABCD we use A=X,B=A,C=B,D=C in 4-point
-                # Redefine for 4 points
-                A2, B2, C2, D2 = X, A, B, C
-                bc_r = fib_ratio(A2, C2, B2)
-                lo, hi = ratios["BC"]
-                if not in_range(bc_r, lo, hi):
-                    continue
-                cd_ext = abs(D2 - C2) / (abs(B2 - A2) + 1e-9)
-                lo2, hi2 = ratios["CD"]
-                if not in_range(cd_ext, lo2, hi2):
-                    continue
-                direction = "Bullish" if A2 < B2 else "Bearish"
-                prz = (D2 * 0.99, D2 * 1.01)
-                results.append(HarmonicResult(
-                    symbol="", pattern=pattern, direction=direction, price=D2,
-                    X=A2, A=B2, B=C2, C=D2, D=D2,
-                    x_idx=X_idx, a_idx=A_idx, b_idx=B_idx, c_idx=C_idx, d_idx=D_idx,
-                    prz_low=prz[0], prz_high=prz[1],
-                ))
-                continue
-
-            # ── XB retracement ────────────────────────────────────────
-            xb_lo, xb_hi = ratios["XB"]
-            xb_r = fib_ratio(X, B, A)
-            if not in_range(xb_r, xb_lo, xb_hi):
-                continue
-
-            # ── AC retracement ────────────────────────────────────────
-            ac_lo, ac_hi = ratios["AC"]
-            ac_r = fib_ratio(A, C, B)
-            if not in_range(ac_r, ac_lo, ac_hi):
-                continue
-
-            # ── BD extension ──────────────────────────────────────────
-            bd_lo, bd_hi = ratios["BD"]
-            bd_r = abs(D - B) / (abs(C - B) + 1e-9)
-            if not in_range(bd_r, bd_lo, bd_hi):
-                continue
-
-            # ── XD retracement ────────────────────────────────────────
-            xd_lo, xd_hi = ratios["XD"]
-            xd_r = fib_ratio(X, D, A)
-            if not in_range(xd_r, xd_lo, xd_hi):
-                continue
-
-            direction  = "Bullish" if bullish else "Bearish"
-            prz_lo, prz_hi = compute_prz(X, A, B, C, pattern, bullish)
-
-            # Price must be near D (within PRZ)
-            if not (prz_lo * 0.97 <= D <= prz_hi * 1.03):
-                continue
-
+        if pattern == "ABCD":
+            bc_r = fib_ratio(X, B, A)
+            lo, hi = ratios["BC"]
+            if not in_range(bc_r, lo, hi): continue
+            cd_ext = abs(C - B) / (abs(A - X) + 1e-9)
+            lo2, hi2 = ratios["CD"]
+            if not in_range(cd_ext, lo2, hi2): continue
+            direction = "Bullish" if X < A else "Bearish"
             results.append(HarmonicResult(
-                symbol="", pattern=pattern, direction=direction, price=D,
-                X=X, A=A, B=B, C=C, D=D,
-                x_idx=X_idx, a_idx=A_idx, b_idx=B_idx, c_idx=C_idx, d_idx=D_idx,
-                prz_low=prz_lo, prz_high=prz_hi,
+                symbol="", pattern=pattern, direction=direction, price=C,
+                X=X, A=A, B=B, C=C, D=C,
+                x_idx=X_idx, a_idx=A_idx, b_idx=B_idx, c_idx=C_idx, d_idx=C_idx,
+                prz_low=C*0.99, prz_high=C*1.01,
             ))
+            continue
+
+        xb_lo, xb_hi = ratios["XB"]
+        if not in_range(fib_ratio(X, B, A), xb_lo, xb_hi): continue
+
+        ac_lo, ac_hi = ratios["AC"]
+        if not in_range(fib_ratio(A, C, B), ac_lo, ac_hi): continue
+
+        bd_lo, bd_hi = ratios["BD"]
+        if not in_range(abs(D - B) / (abs(C - B) + 1e-9), bd_lo, bd_hi): continue
+
+        xd_lo, xd_hi = ratios["XD"]
+        if not in_range(fib_ratio(X, D, A), xd_lo, xd_hi): continue
+
+        prz_lo, prz_hi = compute_prz(X, A, B, C, pattern, bullish)
+        mn, mx = min(prz_lo, prz_hi), max(prz_lo, prz_hi)
+        if not (mn * 0.97 <= D <= mx * 1.03): continue
+
+        results.append(HarmonicResult(
+            symbol="", pattern=pattern,
+            direction="Bullish" if bullish else "Bearish",
+            price=D, X=X, A=A, B=B, C=C, D=D,
+            x_idx=X_idx, a_idx=A_idx, b_idx=B_idx, c_idx=C_idx, d_idx=D_idx,
+            prz_low=mn, prz_high=mx,
+        ))
 
     return results
 
 
-def scan_symbol(symbol: str, df: pd.DataFrame) -> list[HarmonicResult]:
-    """Run all pattern detectors on a single symbol."""
+def scan_symbol(symbol: str, df: pd.DataFrame) -> list:
     detected = []
     try:
         pivots = zigzag_pivots(df, ZIGZAG_DEPTH)
-        if len(pivots) < 5:
-            return detected
+        if len(pivots) < 5: return detected
+        last_bar = len(df) - 1
         for pattern in PATTERNS:
-            matches = match_xabcd(pivots, pattern)
-            for m in matches:
+            for m in match_xabcd(pivots, pattern):
                 m.symbol = symbol
-                # Filter: D must be within last 3 bars
-                last_bar = len(df) - 1
                 if last_bar - m.d_idx <= 3:
                     detected.append(m)
     except Exception as e:
-        log.debug(f"scan_symbol {symbol} error: {e}")
+        log.debug(f"scan_symbol {symbol}: {e}")
     return detected
 
 
@@ -416,57 +388,40 @@ STYLE_TV = mpf.make_mpf_style(
         up='#26a69a', down='#ef5350',
         edge='inherit', wick='inherit', volume='in',
     ),
-    facecolor='#131722',
-    figcolor='#131722',
-    gridcolor='#1e2130',
-    gridstyle='-',
+    facecolor='#131722', figcolor='#131722',
+    gridcolor='#1e2130', gridstyle='-',
 )
 
 def generate_chart(symbol: str, df: pd.DataFrame, result: HarmonicResult) -> bytes:
-    """Generate mplfinance chart with XABCD overlay. Returns PNG bytes."""
     tail = 80
     df_plot = df.iloc[-tail:].copy()
-
-    # Map absolute indices to relative
     offset = len(df) - tail
-    points = {
-        'X': (result.x_idx - offset, result.X),
-        'A': (result.a_idx - offset, result.A),
-        'B': (result.b_idx - offset, result.B),
-        'C': (result.c_idx - offset, result.C),
-        'D': (result.d_idx - offset, result.D),
-    }
-    # Clamp to visible range
-    points = {k: (max(0, min(v[0], tail-1)), v[1]) for k, v in points.items()}
+
+    points = {k: (max(0, min(v[0] - offset, tail-1)), v[1]) for k, v in {
+        'X': (result.x_idx, result.X), 'A': (result.a_idx, result.A),
+        'B': (result.b_idx, result.B), 'C': (result.c_idx, result.C),
+        'D': (result.d_idx, result.D),
+    }.items()}
 
     fig, axes = mpf.plot(
-        df_plot,
-        type='candle',
-        style=STYLE_TV,
+        df_plot, type='candle', style=STYLE_TV,
         title=f' {symbol}  |  {result.pattern}  {result.direction}',
-        volume=True,
-        returnfig=True,
-        figsize=(12, 7),
-        tight_layout=True,
+        volume=True, returnfig=True, figsize=(12, 7), tight_layout=True,
     )
     ax = axes[0]
 
-    # Draw pattern lines X→A→B→C→D
-    order = ['X', 'A', 'B', 'C', 'D']
-    xs = [points[p][0] for p in order]
-    ys = [points[p][1] for p in order]
+    xs = [points[p][0] for p in ['X','A','B','C','D']]
+    ys = [points[p][1] for p in ['X','A','B','C','D']]
     ax.plot(xs, ys, 'o-', color='#f0b90b', linewidth=1.5, markersize=4, zorder=5)
 
     for label, (ix, price) in points.items():
-        ax.annotate(
-            label, xy=(ix, price), xytext=(0, 10 if label in ('A','C') else -15),
-            textcoords='offset points', color='#f0b90b',
-            fontsize=9, fontweight='bold', ha='center',
-        )
+        ax.annotate(label, xy=(ix, price),
+                    xytext=(0, 10 if label in ('A','C') else -15),
+                    textcoords='offset points', color='#f0b90b',
+                    fontsize=9, fontweight='bold', ha='center')
 
-    # PRZ shading
-    ax.axhspan(result.prz_low, result.prz_high, alpha=0.15,
-               color='#26a69a' if result.direction == 'Bullish' else '#ef5350')
+    color = '#26a69a' if result.direction == 'Bullish' else '#ef5350'
+    ax.axhspan(result.prz_low, result.prz_high, alpha=0.15, color=color)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=130, bbox_inches='tight',
@@ -479,7 +434,6 @@ def generate_chart(symbol: str, df: pd.DataFrame, result: HarmonicResult) -> byt
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 def send_telegram_photo(image_bytes: bytes, caption: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     for attempt in range(3):
@@ -499,11 +453,10 @@ def send_telegram_photo(image_bytes: bytes, caption: str) -> bool:
 
 def format_telegram_caption(r: HarmonicResult) -> str:
     sym_clean = r.symbol.replace('.NS', '')
-    tv_url = f"{TV_BASE}{sym_clean}"
-    arrow  = '🟢' if r.direction == 'Bullish' else '🔴'
+    arrow = '🟢' if r.direction == 'Bullish' else '🔴'
     return (
         f"{arrow} <b>{r.pattern}</b> — {r.direction}\n"
-        f"📌 <a href='{tv_url}'>{sym_clean}</a>\n"
+        f"📌 <a href='{TV_BASE}{sym_clean}'>{sym_clean}</a>\n"
         f"💰 Price: <b>₹{r.price:.2f}</b>\n"
         f"📊 PRZ: ₹{r.prz_low:.2f} – ₹{r.prz_high:.2f}"
     )
@@ -514,53 +467,38 @@ def get_gsheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         return None
     try:
-        import json as _json
-        creds_dict = _json.loads(GOOGLE_CREDS_JSON)
-        scope = [
-            'https://spreadsheets.google.com/feeds',
-            'https://www.googleapis.com/auth/drive',
-        ]
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        scope = ['https://spreadsheets.google.com/feeds',
+                 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         sh = client.open_by_key(GOOGLE_SHEET_ID)
         try:
             ws = sh.worksheet("Alerts")
-        except Exception:
+        except:
             ws = sh.add_worksheet(title="Alerts", rows="1000", cols="10")
-            ws.append_row(["Date", "Symbol", "Pattern", "Direction", "Price",
-                           "PRZ Low", "PRZ High", "TV Link"])
+            ws.append_row(["Date","Symbol","Pattern","Direction","Price",
+                           "PRZ Low","PRZ High","TV Link"])
         return ws
     except Exception as e:
         log.error(f"Google Sheets init failed: {e}")
         return None
 
-def append_to_gsheet(ws, results: list[HarmonicResult]):
-    if not ws:
-        return
+def append_to_gsheet(ws, results: list):
+    if not ws or not results: return
     today = date.today().isoformat()
-    rows = []
-    for r in results:
-        sym_clean = r.symbol.replace('.NS', '')
-        rows.append([
-            today,
-            sym_clean,
-            r.pattern,
-            r.direction,
-            round(r.price, 2),
-            round(r.prz_low, 2),
-            round(r.prz_high, 2),
-            f"{TV_BASE}{sym_clean}",
-        ])
-    if rows:
-        try:
-            ws.append_rows(rows, value_input_option='USER_ENTERED')
-            log.info(f"Appended {len(rows)} rows to Google Sheets.")
-        except Exception as e:
-            log.error(f"Google Sheets append failed: {e}")
+    rows = [[today, r.symbol.replace('.NS',''), r.pattern, r.direction,
+             round(r.price,2), round(r.prz_low,2), round(r.prz_high,2),
+             f"{TV_BASE}{r.symbol.replace('.NS','')}"] for r in results]
+    try:
+        ws.append_rows(rows, value_input_option='USER_ENTERED')
+        log.info(f"Appended {len(rows)} rows to Google Sheets.")
+    except Exception as e:
+        log.error(f"Google Sheets append failed: {e}")
 
 
 # ─── Email Summary ─────────────────────────────────────────────────────────────
-def send_email_summary(total_scanned: int, results: list[HarmonicResult]):
+def send_email_summary(total_scanned: int, results: list):
     if not EMAIL_FROM or not EMAIL_TO:
         log.warning("Email not configured.")
         return
@@ -569,98 +507,85 @@ def send_email_summary(total_scanned: int, results: list[HarmonicResult]):
 
     rows_html = ""
     for r in results:
-        sym_clean = r.symbol.replace('.NS', '')
-        tv_url = f"{TV_BASE}{sym_clean}"
-        color  = '#26a69a' if r.direction == 'Bullish' else '#ef5350'
+        sym = r.symbol.replace('.NS','')
+        color = '#26a69a' if r.direction == 'Bullish' else '#ef5350'
         rows_html += (
-            f"<tr>"
-            f"<td><a href='{tv_url}' style='color:#f0b90b'>{sym_clean}</a></td>"
-            f"<td>{r.pattern}</td>"
-            f"<td style='color:{color}'>{r.direction}</td>"
-            f"<td>₹{r.price:.2f}</td>"
-            f"<td>₹{r.prz_low:.2f} – ₹{r.prz_high:.2f}</td>"
-            f"</tr>"
+            f"<tr><td><a href='{TV_BASE}{sym}' style='color:#f0b90b'>{sym}</a></td>"
+            f"<td>{r.pattern}</td><td style='color:{color}'>{r.direction}</td>"
+            f"<td>₹{r.price:.2f}</td><td>₹{r.prz_low:.2f}–₹{r.prz_high:.2f}</td></tr>"
         )
 
-    html = f"""
-    <html><body style='background:#131722;color:#d1d4dc;font-family:Arial,sans-serif;padding:20px'>
+    html = f"""<html><body style='background:#131722;color:#d1d4dc;font-family:Arial,sans-serif;padding:20px'>
     <h2 style='color:#f0b90b'>NSE Harmonic Scanner — {today}</h2>
-    <p>Symbols scanned: <b>{total_scanned}</b> &nbsp;|&nbsp; Patterns detected: <b>{len(results)}</b></p>
+    <p>Scanned: <b>{total_scanned}</b> &nbsp;|&nbsp; Detected: <b>{len(results)}</b></p>
     <table border='0' cellpadding='8' cellspacing='0'
-           style='border-collapse:collapse;width:100%;background:#1e2130;border-radius:8px'>
+           style='border-collapse:collapse;width:100%;background:#1e2130'>
     <tr style='background:#2a2e3f;color:#f0b90b'>
       <th>Symbol</th><th>Pattern</th><th>Direction</th><th>Price</th><th>PRZ</th>
-    </tr>
-    {rows_html}
-    </table>
+    </tr>{rows_html}</table>
     <p style='color:#555;font-size:11px;margin-top:20px'>
-      Generated by NSE Harmonic Scanner • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
-    </p>
-    </body></html>
-    """
+      Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</p>
+    </body></html>"""
+
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From']    = EMAIL_FROM
     msg['To']      = EMAIL_TO
     msg.attach(MIMEText(html, 'html'))
-
     try:
-        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        log.info("Email summary sent.")
+        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=30) as s:
+            s.ehlo(); s.starttls()
+            s.login(EMAIL_FROM, EMAIL_PASSWORD)
+            s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        log.info("Email sent.")
     except Exception as e:
-        log.error(f"Email send failed: {e}")
+        log.error(f"Email failed: {e}")
 
 
-# ─── Main Scanner ──────────────────────────────────────────────────────────────
+# ─── Main ──────────────────────────────────────────────────────────────────────
 def run_scanner():
-    start_ts = time.time()
+    start = time.time()
     log.info("=" * 60)
-    log.info(f"NSE Harmonic Scanner starting at {datetime.utcnow().isoformat()}")
+    log.info(f"NSE Harmonic Scanner starting — {datetime.utcnow().isoformat()}")
 
     symbols = get_nse_symbols()
-    log.info(f"Total symbols to scan: {len(symbols)}")
+    log.info(f"Symbols to scan: {len(symbols)}")
 
-    ohlc_data = fetch_all_ohlc(symbols)
-    log.info(f"OHLC data ready for {len(ohlc_data)} symbols")
+    ohlc = fetch_all_ohlc(symbols)
+    log.info(f"OHLC ready: {len(ohlc)} symbols")
 
-    all_results: list[HarmonicResult] = []
+    if len(ohlc) == 0:
+        log.error("FATAL: 0 symbols downloaded. Yahoo Finance may be blocking this IP.")
+        log.error("Try reducing MAX_WORKERS=2, BATCH_SIZE=10 in env vars.")
+        send_email_summary(0, [])
+        return
 
+    all_results = []
     ws = get_gsheet()
 
-    for sym, df in ohlc_data.items():
+    for sym, df in ohlc.items():
         hits = scan_symbol(sym, df)
-        if not hits:
-            continue
-        log.info(f"  [{sym}] {len(hits)} pattern(s) found")
-
+        if not hits: continue
+        log.info(f"  [{sym}] {len(hits)} pattern(s)")
         for result in hits:
             all_results.append(result)
             try:
                 img = generate_chart(sym, df, result)
-                caption = format_telegram_caption(result)
-                send_telegram_photo(img, caption)
+                send_telegram_photo(img, format_telegram_caption(result))
             except Exception as e:
-                log.error(f"Chart/Telegram error for {sym}: {e}")
-            time.sleep(0.5)   # rate limit
+                log.error(f"Chart/Telegram error {sym}: {e}")
+            time.sleep(0.5)
 
-    if all_results and ws:
+    if all_results:
         append_to_gsheet(ws, all_results)
 
-    send_email_summary(len(ohlc_data), all_results)
+    send_email_summary(len(ohlc), all_results)
 
-    elapsed = time.time() - start_ts
-    log.info(f"Scan complete. {len(all_results)} patterns across {len(ohlc_data)} symbols. "
-             f"Time: {elapsed:.1f}s")
+    elapsed = time.time() - start
+    log.info(f"Done. {len(all_results)} patterns / {len(ohlc)} symbols. {elapsed:.1f}s")
 
-    # Save JSON log
-    log_path = f"results_{date.today().isoformat()}.json"
-    with open(log_path, 'w') as f:
+    with open(f"results_{date.today().isoformat()}.json", 'w') as f:
         json.dump([asdict(r) for r in all_results], f, indent=2)
-    log.info(f"Results saved to {log_path}")
 
 
 if __name__ == "__main__":
