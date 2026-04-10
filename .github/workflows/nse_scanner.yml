@@ -2,8 +2,7 @@ name: NSE Harmonic Scanner
 
 on:
   schedule:
-    # 5:00 PM IST = 11:30 UTC
-    - cron: '30 11 * * 1-5'
+    - cron: '30 11 * * 1-5'   # 5:00 PM IST Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -21,21 +20,15 @@ jobs:
       EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
       EMAIL_SMTP_HOST:    smtp.gmail.com
       EMAIL_SMTP_PORT:    "587"
-      # Conservative settings to avoid Yahoo Finance rate limits
-      BATCH_SIZE:         "25"
-      MAX_WORKERS:        "4"
+      MAX_WORKERS:        "6"
       ZIGZAG_DEPTH:       "12"
-      PRICE_PERIOD:       "1y"
-      PRICE_INTERVAL:     "1d"
+      LOOKBACK_DAYS:      "365"
       FIB_TOLERANCE:      "0.05"
-      DOWNLOAD_RETRIES:   "3"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -46,7 +39,7 @@ jobs:
       - name: Run scanner
         run: python harmonic_scanner.py
 
-      - name: Upload artifacts
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
