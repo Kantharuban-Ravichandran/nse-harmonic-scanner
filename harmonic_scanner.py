@@ -523,12 +523,16 @@ def append_gsheet(ws, results: list):
 def send_email(total: int, results: list):
     if not EMAIL_FROM or not EMAIL_TO: return
     today = date.today().strftime("%d %b %Y")
-    rows = "".join(
-        f"<tr><td><a href='{TV_BASE}{r.symbol}' style='color:#f0b90b'>{r.symbol}</a></td>"
-        f"<td>{r.pattern}</td>"
-        f"<td style='color:{'#26a69a' if r.direction==\"Bullish\" else \"#ef5350\"}'>{r.direction}</td>"
-        f"<td>₹{r.price:.2f}</td><td>₹{r.prz_low:.2f}–₹{r.prz_high:.2f}</td></tr>"
-        for r in results)
+    row_parts = []
+    for r in results:
+        clr = '#26a69a' if r.direction == 'Bullish' else '#ef5350'
+        row_parts.append(
+            f"<tr><td><a href='{TV_BASE}{r.symbol}' style='color:#f0b90b'>{r.symbol}</a></td>"
+            f"<td>{r.pattern}</td>"
+            f"<td style='color:{clr}'>{r.direction}</td>"
+            f"<td>&#8377;{r.price:.2f}</td><td>&#8377;{r.prz_low:.2f}–&#8377;{r.prz_high:.2f}</td></tr>"
+        )
+    rows = "".join(row_parts)
     html = (f"<html><body style='background:#131722;color:#d1d4dc;font-family:Arial;padding:20px'>"
             f"<h2 style='color:#f0b90b'>NSE Harmonic Scanner — {today}</h2>"
             f"<p>Scanned:<b>{total}</b> | Detected:<b>{len(results)}</b></p>"
