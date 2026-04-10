@@ -20,7 +20,7 @@ jobs:
       EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
       EMAIL_SMTP_HOST:    smtp.gmail.com
       EMAIL_SMTP_PORT:    "587"
-      MAX_WORKERS:        "6"
+      MAX_WORKERS:        "4"
       ZIGZAG_DEPTH:       "12"
       LOOKBACK_DAYS:      "365"
       FIB_TOLERANCE:      "0.05"
@@ -35,6 +35,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Verify jugaad-data install
+        run: python -c "from jugaad_data.nse import stock_df; print('jugaad-data OK')"
 
       - name: Run scanner
         run: python harmonic_scanner.py
