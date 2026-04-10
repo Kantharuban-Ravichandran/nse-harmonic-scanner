@@ -1,3 +1,5 @@
+jugaad-data==0.5.3
+yfinance==0.2.51
 pandas==2.2.3
 numpy==1.26.4
 mplfinance==0.12.10b0
